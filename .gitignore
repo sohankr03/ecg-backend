@@ -1,4 +1,4 @@
-﻿# Python
+# Python
 __pycache__/
 *.py[cod]
 
@@ -9,8 +9,11 @@ __pycache__/
 logs/*.csv
 logs/*.log
 
-# MIT-BIH demo data
-demo_data/
+# MIT-BIH demo data (large binaries — pre-downloaded by download_demo_data.py)
+demo_data/*.dat
+demo_data/*.hea
+demo_data/*.xws
+demo_data/*.atr
 
 # Virtual environment
 venv/

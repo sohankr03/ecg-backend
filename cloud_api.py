@@ -201,7 +201,12 @@ def auth_login():
     token   = _make_token(user_id, role)
 
     log.info(f"Login: {email} (role={role})")
-    return jsonify({"token": token, "role": role, "user_id": user_id}), 200
+    return jsonify({
+        "token":    token,
+        "role":     role,
+        "user_id":  user_id,
+        "username": user.get("username", ""),
+    }), 200
 
 
 # ══════════════════════════════════════════════════════════════════════════

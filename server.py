@@ -21,6 +21,7 @@ Then open: http://localhost:5000  (or http://<rpi-hostname>.local:5000)
 
 import sys
 import os
+import queue
 import threading
 import time
 import logging
@@ -285,6 +286,205 @@ def api_status():
     running = eng is not None
     status  = eng.get_status() if eng else "STOPPED"
     return jsonify({"running": running, "status": status, "device_id": EDGE_DEVICE_ID})
+
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Demo API Endpoints (Phase 5g-ii — for B.Tech presentation demo mode)
+# ══════════════════════════════════════════════════════════════════════════
+
+@app.route("/api/demo/records", methods=["GET"])
+def demo_records():
+    """
+    GET /api/demo/records
+    Returns metadata for all available demo records.
+    Used by DemoControlPanel to populate the patient selector dropdown.
+    """
+    from ecg_simulator import DEMO_RECORD_INFO
+    return jsonify(list(DEMO_RECORD_INFO.values())), 200
+
+
+@app.route("/api/demo/start", methods=["POST"])
+def demo_start():
+    """
+    POST /api/demo/start
+    Body: {"record": "200", "mode": "mitbih"} or {"mode": "synthetic"}
+
+    Stops any running engine and starts a fresh one in demo mode
+    using the specified MIT-BIH record (or synthetic fallback).
+    """
+    global engine, push_thread, cloud_thread, push_running
+
+    data        = request.get_json() or {}
+    record_name = data.get("record", "119")
+    mode        = data.get("mode", "mitbih")
+
+    from ecg_simulator import EcgSimulator, DEMO_RECORD_INFO
+
+    # Stop existing engine
+    with engine_lock:
+        old_eng = engine
+    if old_eng is not None:
+        old_eng.stop()
+        with engine_lock:
+            engine = None
+
+    try:
+        sim        = EcgSimulator(record_name=record_name, inject_anomaly=True, loop=True)
+        new_engine = ECGInferenceEngine(demo_mode=True, demo_stream=sim)
+        log.info(f"Demo start: record={record_name}, mode={mode}")
+
+        # Re-resolve patient_id from MongoDB
+        try:
+            from database import collections
+            device_doc = collections.devices.find_one({"device_id": EDGE_DEVICE_ID})
+            if device_doc and device_doc.get("room_number"):
+                patient_doc = collections.patients.find_one(
+                    {"assigned_room": device_doc["room_number"]}
+                )
+                if patient_doc:
+                    new_engine.patient_id = str(patient_doc["_id"])
+                    log.info(f"Demo: assigned patient {new_engine.patient_id}")
+        except Exception as e:
+            log.warning(f"Demo: could not resolve patient_id: {e}")
+
+        new_engine.start()
+
+        with engine_lock:
+            engine = new_engine
+
+        if not push_running:
+            push_running = True
+            push_thread  = threading.Thread(target=push_data_loop,
+                                             name="PushThread", daemon=True)
+            push_thread.start()
+            if CLOUD_API_URL and EDGE_KEY:
+                cloud_thread = threading.Thread(target=cloud_upload_loop,
+                                                name="CloudUploadThread", daemon=True)
+                cloud_thread.start()
+
+        info = DEMO_RECORD_INFO.get(record_name, {
+            "record"     : record_name,
+            "name"       : f"Record {record_name}",
+            "description": "MIT-BIH record",
+            "arrhythmia" : "Unknown",
+            "expected_model_response": "Unknown",
+        })
+
+        return jsonify({
+            "ok"         : True,
+            "record"     : record_name,
+            "description": info.get("description"),
+            "name"       : info.get("name"),
+            "arrhythmia" : info.get("arrhythmia"),
+            "expected"   : info.get("expected_model_response"),
+        }), 200
+
+    except Exception as e:
+        log.error(f"Demo start failed: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/demo/switch-to-arrhythmia", methods=["POST"])
+def demo_switch_arrhythmia():
+    """
+    POST /api/demo/switch-to-arrhythmia
+    Mid-demo: instantly swaps the running simulator to record 200
+    (Ventricular bigeminy) for the live demonstration climax.
+
+    Call flow during presentation:
+      1. Start with record 100 (Normal) → professors see clean ECG
+      2. Click this button → bigeminy arrhythmia starts immediately
+      3. Wait ~15s → ABNORMAL alert fires → buzzer sounds
+    """
+    global engine, push_thread, cloud_thread, push_running
+    from ecg_simulator import EcgSimulator, DEMO_RECORD_INFO
+
+    with engine_lock:
+        old_eng = engine
+    if old_eng is not None:
+        old_eng.stop()
+        with engine_lock:
+            engine = None
+
+    try:
+        record_name = "200"
+        sim         = EcgSimulator(record_name=record_name, inject_anomaly=True, loop=True)
+        new_engine  = ECGInferenceEngine(demo_mode=True, demo_stream=sim)
+        log.info("Demo: switched to ARRHYTHMIA record 200 (Ventricular bigeminy)")
+
+        try:
+            from database import collections
+            device_doc = collections.devices.find_one({"device_id": EDGE_DEVICE_ID})
+            if device_doc and device_doc.get("room_number"):
+                patient_doc = collections.patients.find_one(
+                    {"assigned_room": device_doc["room_number"]}
+                )
+                if patient_doc:
+                    new_engine.patient_id = str(patient_doc["_id"])
+        except Exception as e:
+            log.warning(f"Demo switch: could not resolve patient_id: {e}")
+
+        new_engine.start()
+        with engine_lock:
+            engine = new_engine
+
+        if not push_running:
+            push_running = True
+            push_thread  = threading.Thread(target=push_data_loop,
+                                             name="PushThread", daemon=True)
+            push_thread.start()
+            if CLOUD_API_URL and EDGE_KEY:
+                cloud_thread = threading.Thread(target=cloud_upload_loop,
+                                                name="CloudUploadThread", daemon=True)
+                cloud_thread.start()
+
+        info = DEMO_RECORD_INFO["200"]
+        return jsonify({
+            "ok"         : True,
+            "record"     : "200",
+            "description": info["description"],
+            "name"       : info["name"],
+            "arrhythmia" : info["arrhythmia"],
+            "expected"   : info["expected_model_response"],
+            "message"    : "Switched to arrhythmia mode — ABNORMAL alert expected within ~15s",
+        }), 200
+
+    except Exception as e:
+        log.error(f"Demo switch failed: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/demo/ground-truth", methods=["GET"])
+def demo_ground_truth():
+    """
+    GET /api/demo/ground-truth
+    Returns the current MIT-BIH expert annotation for the running
+    demo stream at the current playback position.
+
+    Lets professors see: "MIT-BIH expert said V (PVC) here,
+    our model says ABNORMAL here — they match!"
+    """
+    with engine_lock:
+        eng = engine
+
+    if eng is None:
+        return jsonify({"error": "No engine running"}), 400
+
+    if not eng.demo_mode or eng.demo_stream is None:
+        return jsonify({"error": "Engine not in demo mode"}), 400
+
+    # Get current display buffer length as a proxy for playback position
+    buf_len = len(eng.get_ecg_buffer())
+    annotation = eng.demo_stream.get_current_annotation(buf_len)
+
+    return jsonify({
+        "record"      : eng.demo_stream.record_name,
+        "beat_label"  : annotation["beat_label"],
+        "description" : annotation["description"],
+        "sample"      : annotation["sample"],
+        "model_latest": eng.get_latest_prediction(),
+    }), 200
 
 
 # ══════════════════════════════════════════════════════════════════════════

@@ -32,12 +32,11 @@ import threading
 import queue
 import logging
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, List
 from collections import deque
 
 import numpy as np
-import pandas as pd
 import serial
 import joblib
 
@@ -448,41 +447,86 @@ class ECGInferenceEngine:
                 "timestamp"        : ts_str,
             }
 
-        # ── Queue Cloud Upload Tasks ──────────────────────────────────
+        # ── MongoDB Direct Insert + Cloud Queue ──────────────────────
         if self.patient_id and self.device_id:
-            end_time = datetime.utcnow()
-            start_time = end_time - pd.Timedelta(seconds=WINDOW_SECONDS)
-            
+            end_time   = datetime.now(timezone.utc)
+            start_time = end_time - timedelta(seconds=WINDOW_SECONDS)
+
             summary_payload = {
-                "patient_id": self.patient_id,
-                "device_id": self.device_id,
-                "start_time": start_time.isoformat() + "Z",
-                "end_time": end_time.isoformat() + "Z",
-                "heart_rate": features.get("heart_rate"),
-                "rr_mean": features.get("rr_mean"),
-                "rr_std": features.get("rr_std"),
-                "sdnn": features.get("sdnn"),
-                "rmssd": features.get("rmssd"),
-                "beat_variance": features.get("beat_variance"),
-                "r_peak_count": features.get("r_peak_count"),
-                "sqi": features.get("sqi"),
-                "prediction": label,
-                "probability": float(prob_abnormal),
-                "consecutive_count": consecutive
+                "patient_id"       : self.patient_id,
+                "device_id"        : self.device_id,
+                "start_time"       : start_time.isoformat(),
+                "end_time"         : end_time.isoformat(),
+                "heart_rate"       : features.get("heart_rate"),
+                "rr_mean"          : features.get("rr_mean"),
+                "rr_std"           : features.get("rr_std"),
+                "sdnn"             : features.get("sdnn"),
+                "rmssd"            : features.get("rmssd"),
+                "beat_variance"    : features.get("beat_variance"),
+                "r_peak_count"     : features.get("r_peak_count"),
+                "sqi"              : features.get("sqi"),
+                "prediction"       : label,
+                "probability"      : float(prob_abnormal),
+                "consecutive_count": consecutive,
             }
+
+            # ── Insert summary directly into MongoDB (local resilience) ─
+            # Data is written to Atlas even when the Render cloud API is
+            # unreachable. The cloud queue is a secondary upload path.
+            try:
+                from database import collections
+                collections.ecg_summaries.insert_one(dict(summary_payload))
+                log.debug("ECG summary inserted into MongoDB.")
+            except Exception as e:
+                log.warning(f"MongoDB summary insert failed: {e}")
+
+            # ── Also queue for cloud HTTP upload (belt-and-suspenders) ──
             if not self._cloud_task_queue.full():
                 self._cloud_task_queue.put({"endpoint": "summary", "data": summary_payload})
 
+            # ── Alert: 3 consecutive ABNORMAL windows ─────────────────
             if consecutive >= ALERT_CONSECUTIVE and is_abnormal:
-                 alert_payload = {
-                     "patient_id": self.patient_id,
-                     "device_id": self.device_id,
-                     "severity": "HIGH",
-                     "consecutive_count": consecutive,
-                     "probability": float(prob_abnormal)
-                 }
-                 if not self._cloud_task_queue.full():
-                    self._cloud_task_queue.put({"endpoint": "alert", "data": alert_payload})
+                # Debounce: skip if an alert already exists for this
+                # patient in the last 5 minutes (avoids alert spam).
+                _should_alert = True
+                try:
+                    from database import collections
+                    five_min_ago = datetime.now(timezone.utc) - timedelta(minutes=5)
+                    recent = collections.alerts.find_one({
+                        "patient_id"  : self.patient_id,
+                        "acknowledged": False,
+                        "timestamp"   : {"$gte": five_min_ago},
+                    })
+                    if recent:
+                        _should_alert = False
+                        log.debug("Alert debounced — recent alert already exists in MongoDB.")
+                except Exception as e:
+                    log.warning(f"Alert debounce check failed (will fire alert): {e}")
+
+                if _should_alert:
+                    alert_payload = {
+                        "patient_id"       : self.patient_id,
+                        "device_id"        : self.device_id,
+                        "severity"         : "HIGH",
+                        "timestamp"        : end_time,
+                        "consecutive_count": consecutive,
+                        "probability"      : float(prob_abnormal),
+                        "acknowledged"     : False,
+                        "acknowledged_by"  : None,
+                    }
+                    # Insert alert directly into MongoDB
+                    try:
+                        from database import collections
+                        collections.alerts.insert_one(dict(alert_payload))
+                        log.warning(f"ALERT inserted into MongoDB: patient={self.patient_id}, consecutive={consecutive}")
+                    except Exception as e:
+                        log.error(f"MongoDB alert insert failed: {e}")
+
+                    # Also queue for cloud HTTP upload (serialisable copy)
+                    cloud_alert = dict(alert_payload)
+                    cloud_alert["timestamp"] = end_time.isoformat()
+                    if not self._cloud_task_queue.full():
+                        self._cloud_task_queue.put({"endpoint": "alert", "data": cloud_alert})
 
 
         # ── Log to CSV ────────────────────────────────────────────────

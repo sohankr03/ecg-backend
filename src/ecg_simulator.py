@@ -34,6 +34,38 @@ MITBIH_FS     = 360   # Native MIT-BIH sampling rate
 TARGET_FS     = 250   # Our system sampling rate
 TARGET_SCALE  = 4095  # 12-bit ADC scale
 
+# ── Demo record metadata (for /api/demo/records endpoint) ─────────────────
+DEMO_RECORD_INFO = {
+    "100": {
+        "record"      : "100",
+        "name"        : "Normal Sinus Rhythm",
+        "description" : "Healthy patient — clean reference signal",
+        "arrhythmia"  : "None",
+        "expected_model_response": "Normal",
+    },
+    "119": {
+        "record"      : "119",
+        "name"        : "PVCs (Premature Ventricular Contractions)",
+        "description" : "Frequent ectopic beats — default simulator record",
+        "arrhythmia"  : "PVC",
+        "expected_model_response": "ABNORMAL",
+    },
+    "200": {
+        "record"      : "200",
+        "name"        : "Ventricular Bigeminy",
+        "description" : "Every other beat is a PVC — most dramatic for demo",
+        "arrhythmia"  : "Bigeminy",
+        "expected_model_response": "ABNORMAL",
+    },
+    "201": {
+        "record"      : "201",
+        "name"        : "Atrial Fibrillation + PVCs",
+        "description" : "Highest BPM variability — most complex arrhythmia",
+        "arrhythmia"  : "AFib+PVC",
+        "expected_model_response": "ABNORMAL",
+    },
+}
+
 
 # ══════════════════════════════════════════════════════════════════════════
 # MIT-BIH Simulator
@@ -66,19 +98,31 @@ class EcgSimulator:
         self._load_record()
 
     def _load_record(self):
-        """Load MIT-BIH record and resample to TARGET_FS."""
+        """Load MIT-BIH record. Tries local demo_data/ cache first, then network."""
         if not WFDB_AVAILABLE:
             print("[EcgSimulator] wfdb not installed — using synthetic ECG.")
             self._signal = self._generate_synthetic_ecg(60)
             return
 
+        # ── Try local cache first (pre-downloaded by download_demo_data.py) ──
+        local_cache = ROOT_DIR / "demo_data"
+        local_path  = local_cache / self.record_name
+
         try:
-            data_dir = ROOT_DIR / "assets" / "mitbih_data"
-            data_dir.mkdir(parents=True, exist_ok=True)
-            record = wfdb.rdrecord(
-                self.record_name, pn_dir='mitdb'
-            )
+            if (local_cache / f"{self.record_name}.dat").exists() and \
+               (local_cache / f"{self.record_name}.hea").exists():
+                record = wfdb.rdrecord(str(local_path))
+                ann    = wfdb.rdann(str(local_path), "atr")
+                print(f"[EcgSimulator] Loaded record {self.record_name} from local cache.")
+            else:
+                print(f"[EcgSimulator] Downloading record {self.record_name} from PhysioNet...")
+                record = wfdb.rdrecord(self.record_name, pn_dir="mitdb")
+                ann    = wfdb.rdann(self.record_name, "atr", pn_dir="mitdb")
+
             raw = record.p_signal[:, 0].astype(float)
+
+            # Store annotations for ground-truth endpoint
+            self._annotations = ann
 
             # Resample from 360 Hz → 250 Hz
             n_orig   = len(raw)
@@ -94,12 +138,13 @@ class EcgSimulator:
             else:
                 self._signal = np.zeros(n_target)
 
-            print(f"[EcgSimulator] Loaded record {self.record_name}: "
+            print(f"[EcgSimulator] Record {self.record_name}: "
                   f"{len(self._signal)} samples at {TARGET_FS} Hz")
         except Exception as e:
             print(f"[EcgSimulator] Could not load {self.record_name}: {e}")
             print("[EcgSimulator] Falling back to synthetic ECG.")
-            self._signal = self._generate_synthetic_ecg(60)
+            self._signal      = self._generate_synthetic_ecg(60)
+            self._annotations = None
 
     def _generate_synthetic_ecg(self, duration_seconds: float = 60) -> np.ndarray:
         """
@@ -165,6 +210,65 @@ class EcgSimulator:
             ecg = ((ecg - s_min) / (s_max - s_min)) * TARGET_SCALE
 
         return ecg
+
+    def get_current_annotation(self, sample_idx: int) -> dict:
+        """
+        Return the MIT-BIH expert beat annotation at or just before sample_idx.
+        Used by the GET /api/demo/ground-truth endpoint.
+
+        Returns:
+            {
+                "beat_label"  : "N" | "V" | "A" | ... (AAMI beat codes),
+                "description" : human-readable label,
+                "sample"      : annotation sample index,
+            }
+        """
+        BEAT_DESCRIPTIONS = {
+            "N" : "Normal beat",
+            "L" : "Left bundle branch block",
+            "R" : "Right bundle branch block",
+            "B" : "Bundle branch block (unspecified)",
+            "A" : "Atrial premature beat",
+            "a" : "Aberrated atrial premature beat",
+            "J" : "Nodal (junctional) premature beat",
+            "S" : "Supraventricular premature beat",
+            "V" : "Premature ventricular contraction (PVC)",
+            "r" : "R-on-T PVC",
+            "F" : "Fusion of ventricular and normal beat",
+            "e" : "Atrial escape beat",
+            "j" : "Nodal (junctional) escape beat",
+            "n" : "Supraventricular escape beat",
+            "E" : "Ventricular escape beat",
+            "/" : "Paced beat",
+            "f" : "Fusion of paced and normal beat",
+            "Q" : "Unclassifiable beat",
+            "+" : "Rhythm change annotation",
+        }
+
+        if self._annotations is None:
+            return {"beat_label": "?", "description": "No annotations (synthetic mode)", "sample": 0}
+
+        samples = self._annotations.sample
+        symbols = self._annotations.symbol
+
+        # Scale sample index from TARGET_FS back to MITBIH_FS
+        mitbih_idx = int(sample_idx * MITBIH_FS / TARGET_FS)
+
+        # Find the annotation closest to (but not after) this sample
+        best_label  = "?"
+        best_sample = 0
+        for s, sym in zip(samples, symbols):
+            if s <= mitbih_idx:
+                best_label  = sym
+                best_sample = int(s)
+            else:
+                break
+
+        return {
+            "beat_label" : best_label,
+            "description": BEAT_DESCRIPTIONS.get(best_label, f"Unknown ({best_label})"),
+            "sample"     : best_sample,
+        }
 
     def stream(self) -> Generator[Tuple[float, int], None, None]:
         """
