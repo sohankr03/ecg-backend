@@ -298,6 +298,57 @@
     .info-label { font-size: 12px; color: var(--text-muted); }
     .info-val   { font-size: 12px; font-weight: 500; color: var(--text); font-family: 'JetBrains Mono', monospace; }
 
+    /* ── Mode Selector ───────────────────────────────────────────── */
+    .mode-selector {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 4px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+    }
+    .mode-btn {
+      padding: 5px 14px;
+      border-radius: 6px;
+      border: none;
+      background: transparent;
+      color: var(--text-muted);
+      font-family: inherit;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.2s;
+      letter-spacing: 0.3px;
+    }
+    .mode-btn.active {
+      background: var(--surface2);
+      color: var(--text);
+      border: 1px solid var(--border);
+    }
+    .mode-btn.active.hw  { color: var(--accent); border-color: rgba(0,212,170,0.4); }
+    .mode-btn.active.demo { color: var(--warn);  border-color: rgba(251,191,36,0.4); }
+
+    #port-field {
+      display: none;
+      align-items: center;
+      gap: 6px;
+    }
+    #port-field.show { display: flex; }
+    #port-input {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      color: var(--text);
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 12px;
+      padding: 5px 10px;
+      width: 160px;
+      outline: none;
+    }
+    #port-input:focus { border-color: rgba(0,212,170,0.5); }
+    #port-label { font-size: 12px; color: var(--text-muted); white-space: nowrap; }
+
     /* ── Demo Mode Banner ────────────────────────────────────────── */
     #demo-banner {
       display: none;
@@ -333,6 +384,19 @@
         <span class="dot"></span>
         <span id="conn-text">Disconnected</span>
       </div>
+
+      <!-- Mode selector -->
+      <div class="mode-selector">
+        <button id="mode-demo" class="mode-btn active demo" onclick="setMode('demo')">Demo</button>
+        <button id="mode-hw"   class="mode-btn hw"          onclick="setMode('hardware')">Hardware</button>
+      </div>
+
+      <!-- Serial port field (hardware mode only) -->
+      <div id="port-field">
+        <span id="port-label">Port:</span>
+        <input id="port-input" type="text" value="/dev/ttyUSB0" placeholder="/dev/ttyUSB0" />
+      </div>
+
       <button id="btn-start" class="btn primary" onclick="startEngine()">▶ Start</button>
       <button id="btn-stop"  class="btn danger"  onclick="stopEngine()" disabled>■ Stop</button>
       <button id="btn-cal"   class="btn"          onclick="calibrate()"  disabled>⚙ Calibrate</button>
@@ -375,13 +439,14 @@
 
       <!-- Features -->
       <div class="info-card">
-        <div class="info-card-title">Heart Features</div>
+        <div class="info-card-title">HRV Features</div>
         <div id="features-list">
-          <div class="feature-row"><span class="feature-name">RR Interval</span><span class="feature-value" id="feat-rr">—</span></div>
-          <div class="feature-row"><span class="feature-name">QRS Duration</span><span class="feature-value" id="feat-qrs">—</span></div>
-          <div class="feature-row"><span class="feature-name">PR Interval</span><span class="feature-value" id="feat-pr">—</span></div>
-          <div class="feature-row"><span class="feature-name">QT Interval</span><span class="feature-value" id="feat-qt">—</span></div>
-          <div class="feature-row"><span class="feature-name">ST Elevation</span><span class="feature-value" id="feat-st">—</span></div>
+          <div class="feature-row"><span class="feature-name">RR Mean</span><span class="feature-value" id="feat-rr-mean">—</span></div>
+          <div class="feature-row"><span class="feature-name">RR Std</span><span class="feature-value" id="feat-rr-std">—</span></div>
+          <div class="feature-row"><span class="feature-name">SDNN</span><span class="feature-value" id="feat-sdnn">—</span></div>
+          <div class="feature-row"><span class="feature-name">RMSSD</span><span class="feature-value" id="feat-rmssd">—</span></div>
+          <div class="feature-row"><span class="feature-name">Beat Variance</span><span class="feature-value" id="feat-beat-var">—</span></div>
+          <div class="feature-row"><span class="feature-name">SQI</span><span class="feature-value" id="feat-sqi">—</span></div>
         </div>
       </div>
 
@@ -507,20 +572,27 @@ socket.on('update', (payload) => {
 
   // ── Features ───────────────────────────────────────────────────────
   if (features) {
-    const set = (id, key, unit='') => {
+    const set = (id, key, unit='', decimals=1) => {
       const el = document.getElementById(id);
       const val = features[key];
-      el.textContent = val != null ? `${val}${unit}` : '—';
+      if (val != null && val !== 0) {
+        el.textContent = `${parseFloat(val).toFixed(decimals)}${unit}`;
+      } else {
+        el.textContent = '—';
+      }
     };
-    set('feat-rr',  'rr_interval',   ' ms');
-    set('feat-qrs', 'qrs_duration',  ' ms');
-    set('feat-pr',  'pr_interval',   ' ms');
-    set('feat-qt',  'qt_interval',   ' ms');
-    set('feat-st',  'st_elevation',  ' mV');
+    set('feat-rr-mean',  'rr_mean',       ' ms', 1);
+    set('feat-rr-std',   'rr_std',        ' ms', 1);
+    set('feat-sdnn',     'sdnn',          ' ms', 1);
+    set('feat-rmssd',    'rmssd',         ' ms', 1);
+    set('feat-beat-var', 'beat_variance', ' ms²', 0);
+    set('feat-sqi',      'sqi',           '',    2);
 
-    // HR from features or prediction
-    const hr = features.heart_rate || features.hr;
-    if (hr != null) document.getElementById('hr-display').innerHTML = `${Math.round(hr)}<span class="unit">bpm</span>`;
+    // HR from features
+    const hr = features.heart_rate;
+    if (hr != null && hr > 0) {
+      document.getElementById('hr-display').innerHTML = `${Math.round(hr)}<span class="unit">bpm</span>`;
+    }
   }
 
   // ── Patient ────────────────────────────────────────────────────────
@@ -542,15 +614,39 @@ async function loadDeviceInfo() {
 }
 loadDeviceInfo();
 
+// ── Mode Toggle ──────────────────────────────────────────────────────────
+let selectedMode = 'demo';
+
+function setMode(mode) {
+  selectedMode = mode;
+  const demoBtn = document.getElementById('mode-demo');
+  const hwBtn   = document.getElementById('mode-hw');
+  const portFld = document.getElementById('port-field');
+
+  demoBtn.classList.toggle('active', mode === 'demo');
+  hwBtn.classList.toggle('active',   mode === 'hardware');
+  portFld.classList.toggle('show',   mode === 'hardware');
+}
+
 // ── Controls ─────────────────────────────────────────────────────────────
 async function startEngine() {
-  isDemoMode = true; // default to demo on local dev
-  document.getElementById('demo-banner').classList.add('show');
+  const isDemo = selectedMode === 'demo';
+  const port   = document.getElementById('port-input').value.trim() || '/dev/ttyUSB0';
+
+  if (isDemo) {
+    document.getElementById('demo-banner').classList.add('show');
+  } else {
+    document.getElementById('demo-banner').classList.remove('show');
+  }
+
+  const body = isDemo
+    ? { demo_mode: true }
+    : { demo_mode: false, port };
 
   const r = await fetch('/api/start', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ demo_mode: true })
+    body: JSON.stringify(body)
   });
   const d = await r.json();
 
@@ -558,8 +654,13 @@ async function startEngine() {
     document.getElementById('btn-start').disabled = true;
     document.getElementById('btn-stop').disabled  = false;
     document.getElementById('btn-cal').disabled   = false;
+    // Lock mode buttons while running
+    document.getElementById('mode-demo').disabled = true;
+    document.getElementById('mode-hw').disabled   = true;
+    document.getElementById('port-input').disabled = true;
   } else {
-    alert('Failed to start engine: ' + (d.error || 'Unknown error'));
+    alert('Failed to start: ' + (d.error || 'Unknown error'));
+    document.getElementById('demo-banner').classList.remove('show');
   }
 }
 
@@ -571,6 +672,10 @@ async function stopEngine() {
   document.getElementById('demo-banner').classList.remove('show');
   document.getElementById('chart-card').classList.remove('active');
   document.getElementById('engine-status').textContent = '—';
+  // Unlock mode buttons
+  document.getElementById('mode-demo').disabled  = false;
+  document.getElementById('mode-hw').disabled    = false;
+  document.getElementById('port-input').disabled = false;
 }
 
 async function calibrate() {

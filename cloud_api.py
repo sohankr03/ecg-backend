@@ -332,7 +332,7 @@ def doctor_patients():
         ]
     }))
 
-    return jsonify([_serialize(p) for p in patients]), 200
+    return jsonify({"patients": [_serialize(p) for p in patients]}), 200
 
 
 @app.route("/api/patients/<patient_id>/ecg-history", methods=["GET"])
@@ -363,11 +363,11 @@ def ecg_history(patient_id: str):
     total = get_col("ecg_summaries").count_documents({"patient_id": patient_oid})
 
     return jsonify({
-        "data":    docs,
-        "total":   total,
-        "page":    page,
-        "limit":   limit,
-        "pages":   (total + limit - 1) // limit,
+        "summaries": docs,
+        "total":     total,
+        "page":      page,
+        "limit":     limit,
+        "pages":     (total + limit - 1) // limit,
     }), 200
 
 
@@ -397,7 +397,7 @@ def get_alerts():
         .sort("timestamp", -1)
         .limit(100)
     )
-    return jsonify([_serialize(a) for a in alerts]), 200
+    return jsonify({"alerts": [_serialize(a) for a in alerts]}), 200
 
 
 @app.route("/api/alerts/<alert_id>/acknowledge", methods=["POST"])
@@ -497,8 +497,46 @@ def admin_create_user():
     except DuplicateKeyError:
         return jsonify({"error": f"Email already exists: {email}"}), 409
 
+    user_oid = result.inserted_id
+
+    # Auto-create patient record so assign-patient works immediately
+    if role == "patient":
+        get_col("patients").insert_one({
+            "user_id":          user_oid,
+            "name":             username,
+            "dob":              None,
+            "assigned_room":    None,
+            "assigned_doctors": [],
+            "assigned_nurses":  [],
+            "created_at":       datetime.now(timezone.utc),
+        })
+
     log.info(f"Admin created user: {email} (role={role})")
-    return jsonify({"ok": True, "user_id": str(result.inserted_id)}), 201
+    return jsonify({"ok": True, "user_id": str(user_oid)}), 201
+
+
+@app.route("/api/admin/users", methods=["GET"])
+@require_jwt("admin")
+def admin_list_users():
+    """GET /api/admin/users — list all users (admin only)."""
+    users = list(get_col("users").find({}, {"password_hash": 0}))
+    return jsonify({"users": [_serialize(u) for u in users]}), 200
+
+
+@app.route("/api/admin/devices", methods=["GET"])
+@require_jwt("admin")
+def admin_list_devices():
+    """GET /api/admin/devices — list all registered RPi devices."""
+    devices = list(get_col("devices").find({}))
+    return jsonify({"devices": [_serialize(d) for d in devices]}), 200
+
+
+@app.route("/api/admin/patients", methods=["GET"])
+@require_jwt("admin")
+def admin_list_patients():
+    """GET /api/admin/patients — list all patients."""
+    patients = list(get_col("patients").find({}))
+    return jsonify({"patients": [_serialize(p) for p in patients]}), 200
 
 
 @app.route("/api/admin/assign-device", methods=["POST"])
@@ -558,6 +596,31 @@ def admin_assign_patient():
     return jsonify({"ok": True}), 200
 
 
+@app.route("/api/admin/release-patient", methods=["POST"])
+@require_jwt("admin")
+def admin_release_patient():
+    """
+    POST /api/admin/release-patient
+    Body: {"patient_id": "<ObjectId>"}
+    Clears the patient's assigned_room so the room can be given to another patient.
+    """
+    data           = request.get_json() or {}
+    patient_id_str = data.get("patient_id", "")
+    try:
+        patient_oid = _oid(patient_id_str)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+    result = get_col("patients").update_one(
+        {"_id": patient_oid},
+        {"$set": {"assigned_room": None}},
+    )
+    if result.matched_count == 0:
+        return jsonify({"error": "Patient not found"}), 404
+
+    return jsonify({"ok": True}), 200
+
+
 @app.route("/api/admin/assign-doctor", methods=["POST"])
 @require_jwt("admin")
 def admin_assign_doctor():
@@ -580,7 +643,13 @@ def admin_assign_doctor():
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
 
-    field = "assigned_doctors" if staff_role == "doctor" else "assigned_nurses"
+    # Look up the actual role from the users collection instead of trusting the
+    # frontend payload — ensures nurses go into assigned_nurses, not assigned_doctors.
+    staff_user = get_col("users").find_one({"_id": doctor_oid}, {"role": 1})
+    if staff_user:
+        staff_role = staff_user.get("role", "doctor")
+
+    field = "assigned_nurses" if staff_role == "nurse" else "assigned_doctors"
 
     result = get_col("patients").update_one(
         {"_id": patient_oid},
@@ -589,7 +658,39 @@ def admin_assign_doctor():
     if result.matched_count == 0:
         return jsonify({"error": "Patient not found"}), 404
 
-    return jsonify({"ok": True}), 200
+    return jsonify({"ok": True, "field": field}), 200
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Admin Utility
+# ══════════════════════════════════════════════════════════════════════════
+
+@app.route("/api/admin/fix-patients", methods=["POST"])
+@require_jwt("admin")
+def admin_fix_patients():
+    """
+    POST /api/admin/fix-patients
+    One-time migration: create missing patients documents for any user with
+    role=patient that has no corresponding patients record.
+    Safe to call multiple times.
+    """
+    patient_users = list(get_col("users").find({"role": "patient"}))
+    created = []
+    for u in patient_users:
+        existing = get_col("patients").find_one({"user_id": u["_id"]})
+        if not existing:
+            get_col("patients").insert_one({
+                "user_id":          u["_id"],
+                "name":             u.get("username", ""),
+                "dob":              None,
+                "assigned_room":    None,
+                "assigned_doctors": [],
+                "assigned_nurses":  [],
+                "created_at":       datetime.now(timezone.utc),
+            })
+            created.append(u.get("email"))
+    log.info(f"fix-patients: created {len(created)} missing records: {created}")
+    return jsonify({"ok": True, "created": created, "total_fixed": len(created)}), 200
 
 
 # ══════════════════════════════════════════════════════════════════════════

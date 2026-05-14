@@ -29,6 +29,10 @@ try:
 except ImportError:
     WFDB_AVAILABLE = False
 
+# Module-level cache: record_name → (signal_array, annotations)
+# Populated on first load; reused by all subsequent EcgSimulator instances.
+_RECORD_CACHE: dict = {}
+
 # ── Configuration ─────────────────────────────────────────────────────────
 MITBIH_FS     = 360   # Native MIT-BIH sampling rate
 TARGET_FS     = 250   # Our system sampling rate
@@ -98,13 +102,19 @@ class EcgSimulator:
         self._load_record()
 
     def _load_record(self):
-        """Load MIT-BIH record. Tries local demo_data/ cache first, then network."""
+        """Load MIT-BIH record. In-memory cache → local demo_data/ → PhysioNet network."""
         if not WFDB_AVAILABLE:
             print("[EcgSimulator] wfdb not installed — using synthetic ECG.")
             self._signal = self._generate_synthetic_ecg(60)
             return
 
-        # ── Try local cache first (pre-downloaded by download_demo_data.py) ──
+        # ── In-memory cache: already parsed this session ───────────────────
+        if self.record_name in _RECORD_CACHE:
+            self._signal, self._annotations = _RECORD_CACHE[self.record_name]
+            print(f"[EcgSimulator] Record {self.record_name} loaded from in-memory cache.")
+            return
+
+        # ── Try local demo_data/ files (pre-downloaded) ────────────────────
         local_cache = ROOT_DIR / "demo_data"
         local_path  = local_cache / self.record_name
 
@@ -121,9 +131,6 @@ class EcgSimulator:
 
             raw = record.p_signal[:, 0].astype(float)
 
-            # Store annotations for ground-truth endpoint
-            self._annotations = ann
-
             # Resample from 360 Hz → 250 Hz
             n_orig   = len(raw)
             n_target = int(n_orig * TARGET_FS / MITBIH_FS)
@@ -134,9 +141,14 @@ class EcgSimulator:
             # Scale to 12-bit ADC range
             s_min, s_max = resampled.min(), resampled.max()
             if s_max > s_min:
-                self._signal = ((resampled - s_min) / (s_max - s_min)) * TARGET_SCALE
+                signal = ((resampled - s_min) / (s_max - s_min)) * TARGET_SCALE
             else:
-                self._signal = np.zeros(n_target)
+                signal = np.zeros(n_target)
+
+            # Store in module-level cache for instant reuse
+            _RECORD_CACHE[self.record_name] = (signal, ann)
+            self._signal      = signal
+            self._annotations = ann
 
             print(f"[EcgSimulator] Record {self.record_name}: "
                   f"{len(self._signal)} samples at {TARGET_FS} Hz")
